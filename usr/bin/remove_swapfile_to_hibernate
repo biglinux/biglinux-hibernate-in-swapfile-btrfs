@@ -1,0 +1,11 @@
+#!/bin/bash
+
+# return zram
+swapon /dev/zram0
+
+# Clean hibernate file
+swapoff /swapfc/swapfile/hibernate
+rm -f /swapfc/swapfile/hibernate
+
+# Clean GRUB
+sed -i '0,/resume=UUID/{s/resume=UUID=[^ ]* resume_offset=[^ ]* //g;}' /boot/grub/grub.cfg

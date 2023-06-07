@@ -1,0 +1,10 @@
+[Unit]
+Description=Enable swapfile to hibernate
+Before=systemd-suspend-then-hibernate.service systemd-hibernate.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/make_swapfile_to_hibernate
+
+[Install]
+RequiredBy=hibernate.target

@@ -1,8 +1,8 @@
 # Maintainer: Barnabé di Kartola <barnabedikartola@gmail.com>
 
-pkgname=biglinux-package-template
-pkgdesc="Package template for biglinux"
-# depends=('')
+pkgname=biglinux-hibernate-in-swapfile-btrfs
+pkgdesc="Use hibernate in btrfs fileswap"
+depends=('biglinux-systemd-swap')
 # makedepends=('')
 # conflicts=('')
 pkgver=$(date +%y.%m.%d)

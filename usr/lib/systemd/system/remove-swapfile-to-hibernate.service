@@ -1,0 +1,10 @@
+[Unit]
+Description=Remove swapfile to hibernate
+After=systemd-suspend-then-hibernate.service systemd-hibernate.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/remove_swapfile_to_hibernate
+
+[Install]
+RequiredBy=hibernate.target

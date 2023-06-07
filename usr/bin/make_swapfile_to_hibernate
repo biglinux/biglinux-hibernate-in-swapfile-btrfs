@@ -1,0 +1,46 @@
+#!/bin/bash
+
+# Clean hibernate file
+swapoff /swapfc/swapfile/hibernate
+rm -f /swapfc/swapfile/hibernate
+
+
+zram_to_hibernate="$(( $(grep '/dev/zram0' /proc/swaps | awk '{ print $4 }') * 1024))"
+ram_to_hibernate="$(($(cat /sys/power/image_size) * 5 / 4 ))"
+memory_to_hibernate="$(( $zram_to_hibernate + $ram_to_hibernate ))"
+free_partition_space="$(btrfs filesystem usage -b /swapfc | awk '/Free \(estimated\)/{print $NF}' | tr -d ')' )"
+
+if [ "$free_partition_space" -lt "$memory_to_hibernate" ]; then
+    echo "No have free space in partition to hibernate"
+    exit 1
+fi
+
+
+# total_mem_used=$(($(free -mt | awk '/Total/{print $3}') * 2))
+btrfs filesystem mkswapfile --size $memory_to_hibernate --uuid clear /swapfc/swapfile/hibernate
+btrfs inspect-internal map-swapfile -r /swapfc/swapfile/hibernate
+swapon /swapfc/swapfile/hibernate
+
+
+# Disable zram
+# systemctl stop systemd-swap
+
+# Disable zram
+swapoff /dev/zram0
+
+# Disable swapfiles
+# swapoff /swapfc/swapfile/[0-9]*
+
+device_id="$(lsblk --raw | grep '/swapfc\\' | cut -f2 -d" ")"
+file_offset="$(btrfs inspect-internal map-swapfile -r /swapfc/swapfile/hibernate)"
+uuid="$(blkid -s UUID -o value $(df -P /swapfc/ | awk 'NR==2 {print $1}'))"
+
+# Clean GRUB
+sed -i '0,/resume=UUID/{s/resume=UUID=[^ ]* resume_offset=[^ ]* //g;}' /boot/grub/grub.cfg
+
+# Apply new config in grub with resume UUID and resume Offset
+sed -i '0,/rootflags=/s|rootflags=|resume=UUID='"$uuid"' resume_offset='"$file_offset"' rootflags=|' /boot/grub/grub.cfg
+
+
+echo "$device_id" > /sys/power/resume
+echo "$file_offset" > /sys/power/resume_offset

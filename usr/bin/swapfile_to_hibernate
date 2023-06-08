@@ -4,6 +4,12 @@
 
 if [ "$1" = "enable" ]; then
 
+    # Enable in mkinitramfs
+    if ! grep -q "resume" <<< "$(grep -o 'HOOKS=".*"' /etc/mkinitcpio.conf)"; then
+        sed -i 's/\(HOOKS=".*\)"/\1 resume"/' /etc/mkinitcpio.conf
+        mkinitcpio -P
+    fi
+
     # Disable swap size verify before start systemd hibernate, because genarate swapfile after this verification
     # Before really hibernate have another verification
     mkdir -p /etc/systemd/system/systemd-logind.service.d/

@@ -6,7 +6,7 @@ if [ "$1" = "enable" ]; then
 
     # Enable in mkinitramfs
     if ! grep -q "resume" <<< "$(grep -o 'HOOKS=".*"' /etc/mkinitcpio.conf)"; then
-        sed -i 's/\(HOOKS=".*\)"/\1 resume"/' /etc/mkinitcpio.conf
+        sed -Ei 's/HOOKS=\((.*)\)/HOOKS=(\1 resume)/' /etc/mkinitcpio.conf
         mkinitcpio -P
     fi
 

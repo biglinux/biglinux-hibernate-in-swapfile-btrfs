@@ -1,11 +1,49 @@
 #!/bin/bash
+set -euo pipefail
 
-# return zram
-swapon /dev/zram0
+[[ $EUID -ne 0 ]] && { echo "Error: must run as root" >&2; exit 1; }
 
-# Clean hibernate file
-swapoff /swapfc/swapfile/hibernate
-rm -f /swapfc/swapfile/hibernate
+# Prevent concurrent execution
+LOCK_FILE="/run/lock/swapfile-hibernate.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "Another instance is already running" >&2
+    exit 1
+fi
 
-# Clean GRUB
-sed -i '0,/resume=UUID/{s/resume=UUID=[^ ]* resume_offset=[^ ]* //g;}' /boot/grub/grub.cfg
+# Cleanup after hibernate resume: remove temporary swapfile, restore swap management
+
+# Read swap path from daemon config, fallback to /swapfile
+SWAP_BASE="/swapfile"
+if [[ -f /etc/systemd/swap.conf ]]; then
+    configured_path=$(grep -E '^swapfile_path=' /etc/systemd/swap.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'")
+    [[ -n "$configured_path" ]] && SWAP_BASE="$configured_path"
+fi
+
+HIBERNATE_FILE="${SWAP_BASE}/hibernate"
+
+# Remove hibernate swap file
+swapoff "$HIBERNATE_FILE" 2>/dev/null || true
+rm -f "$HIBERNATE_FILE"
+
+# Clean resume parameters from GRUB
+if [[ -f /boot/grub/grub.cfg ]]; then
+    sed -i 's/resume=UUID=[^ ]* resume_offset=[^ ]* //g' /boot/grub/grub.cfg
+fi
+
+# Clean resume parameters from systemd-boot entries
+if [[ -d /boot/loader/entries ]]; then
+    for entry in /boot/loader/entries/*.conf; do
+        [[ -f "$entry" ]] || continue
+        sed -i "s/ resume=UUID=[^ ]* resume_offset=[^ ]*//g" "$entry"
+    done
+fi
+
+# Clear live kernel resume parameters to avoid stale references
+echo 0 > /sys/power/resume_offset 2>/dev/null || true
+echo 0:0 > /sys/power/resume 2>/dev/null || true
+
+# Restart daemon to restore normal swap management (zram, swapfiles, etc.)
+systemctl restart systemd-swap.service 2>/dev/null || true
+
+echo "Hibernate cleanup complete"

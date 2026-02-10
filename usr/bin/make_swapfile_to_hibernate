@@ -1,46 +1,138 @@
 #!/bin/bash
+set -euo pipefail
 
-# Clean hibernate file
-swapoff /swapfc/swapfile/hibernate
-rm -f /swapfc/swapfile/hibernate
+[[ $EUID -ne 0 ]] && { echo "Error: must run as root" >&2; exit 1; }
 
-
-zram_to_hibernate="$(( $(grep '/dev/zram0' /proc/swaps | awk '{ print $4 }') * 1024))"
-ram_to_hibernate="$(($(cat /sys/power/image_size) * 5 / 4 ))"
-memory_to_hibernate="$(( $zram_to_hibernate + $ram_to_hibernate ))"
-free_partition_space="$(btrfs filesystem usage -b /swapfc | awk '/Free \(estimated\)/{print $NF}' | tr -d ')' )"
-
-if [ "$free_partition_space" -lt "$memory_to_hibernate" ]; then
-    echo "No have free space in partition to hibernate"
+# Prevent concurrent execution
+LOCK_FILE="/run/lock/swapfile-hibernate.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "Another instance is already running" >&2
     exit 1
 fi
 
+# Cleanup on failure
+CLEANUP_NEEDED=false
+cleanup() {
+    if [[ "$CLEANUP_NEEDED" == "true" ]]; then
+        swapoff "$HIBERNATE_FILE" 2>/dev/null || true
+        rm -f "$HIBERNATE_FILE" 2>/dev/null || true
+    fi
+}
+trap cleanup ERR EXIT
 
-# total_mem_used=$(($(free -mt | awk '/Total/{print $3}') * 2))
-btrfs filesystem mkswapfile --size $memory_to_hibernate --uuid clear /swapfc/swapfile/hibernate
-btrfs inspect-internal map-swapfile -r /swapfc/swapfile/hibernate
-swapon /swapfc/swapfile/hibernate
+# Prepare a swapfile for hibernation on btrfs, ext4, or xfs
+# Creates a temporary swap file, sets kernel resume parameters, and patches bootloader
 
+# Read swap path from daemon config, fallback to /swapfile
+SWAP_BASE="/swapfile"
+if [[ -f /etc/systemd/swap.conf ]]; then
+    configured_path=$(grep -E '^swapfile_path=' /etc/systemd/swap.conf 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"'")
+    [[ -n "$configured_path" ]] && SWAP_BASE="$configured_path"
+fi
 
-# Disable zram
-# systemctl stop systemd-swap
+HIBERNATE_FILE="${SWAP_BASE}/hibernate"
 
-# Disable zram
-swapoff /dev/zram0
+# Detect filesystem type
+FSTYPE=$(findmnt -n -o FSTYPE --target "$SWAP_BASE" 2>/dev/null || echo "unknown")
 
-# Disable swapfiles
-# swapoff /swapfc/swapfile/[0-9]*
+# Ensure swap directory exists
+mkdir -p "$SWAP_BASE"
 
-device_id="$(lsblk --raw | grep '/swapfc\\' | cut -f2 -d" ")"
-file_offset="$(btrfs inspect-internal map-swapfile -r /swapfc/swapfile/hibernate)"
-uuid="$(blkid -s UUID -o value $(df -P /swapfc/ | awk 'NR==2 {print $1}'))"
+# Clean any existing hibernate file
+swapoff "$HIBERNATE_FILE" 2>/dev/null || true
+rm -f "$HIBERNATE_FILE"
 
-# Clean GRUB
-sed -i '0,/resume=UUID/{s/resume=UUID=[^ ]* resume_offset=[^ ]* //g;}' /boot/grub/grub.cfg
+# Calculate required space: zram used data + kernel image_size with 25% headroom
+zram_used=$(awk '/\/dev\/zram[0-9]/{s+=$4} END{print s+0}' /proc/swaps)
+zram_to_hibernate=$(( zram_used * 1024 ))
+ram_to_hibernate=$(( $(cat /sys/power/image_size) * 5 / 4 ))
+memory_to_hibernate=$(( zram_to_hibernate + ram_to_hibernate ))
 
-# Apply new config in grub with resume UUID and resume Offset
-sed -i '0,/rootflags=/s|rootflags=|resume=UUID='"$uuid"' resume_offset='"$file_offset"' rootflags=|' /boot/grub/grub.cfg
+# Verify free space on the partition (filesystem-agnostic)
+free_partition_space=$(df -B1 --output=avail "$SWAP_BASE" | tail -1 | tr -d ' ')
 
+if [[ "$free_partition_space" -lt "$memory_to_hibernate" ]]; then
+    echo "ERROR: Not enough free space for hibernate (need $(( memory_to_hibernate / 1048576 ))M, have $(( free_partition_space / 1048576 ))M)"
+    exit 1
+fi
 
+# Create swapfile based on filesystem type
+case "$FSTYPE" in
+    btrfs)
+        btrfs filesystem mkswapfile --size "$memory_to_hibernate" --uuid clear "$HIBERNATE_FILE"
+        ;;
+    ext4|xfs)
+        umask 077
+        fallocate -l "$memory_to_hibernate" "$HIBERNATE_FILE"
+        chmod 600 "$HIBERNATE_FILE"
+        mkswap "$HIBERNATE_FILE" >/dev/null
+        ;;
+    *)
+        echo "ERROR: Unsupported filesystem type: $FSTYPE"
+        exit 1
+        ;;
+esac
+
+CLEANUP_NEEDED=true
+swapon "$HIBERNATE_FILE"
+
+# Disable all zram devices to force hibernate image into the swapfile
+for zram_dev in /dev/zram*; do
+    [[ -b "$zram_dev" ]] && swapoff "$zram_dev" 2>/dev/null || true
+done
+
+# Disable daemon swap files to ensure only the hibernate file is used
+for f in "$SWAP_BASE"/[0-9]*; do
+    [[ -e "$f" ]] && swapoff "$f" 2>/dev/null || true
+done
+
+# Get resume parameters
+resume_dev=$(findmnt -n -o SOURCE --target "$SWAP_BASE" | head -1)
+uuid=$(blkid -s UUID -o value "$resume_dev")
+
+# Get file offset based on filesystem
+case "$FSTYPE" in
+    btrfs)
+        file_offset=$(btrfs inspect-internal map-swapfile -r "$HIBERNATE_FILE")
+        ;;
+    ext4|xfs)
+        file_offset=$(filefrag -v "$HIBERNATE_FILE" | awk '/^ *0:/{print $4}' | sed 's/\.\.//')
+        ;;
+esac
+
+# Validate before writing
+if [[ -z "${file_offset:-}" || -z "${uuid:-}" || -z "${resume_dev:-}" ]]; then
+    echo "ERROR: Could not determine resume parameters (dev=$resume_dev, uuid=$uuid, offset=${file_offset:-})"
+    exit 1
+fi
+
+# Get device major:minor for /sys/power/resume
+device_id=$(lsblk -rno MAJ:MIN "$resume_dev" | head -1)
+if [[ -z "$device_id" ]]; then
+    echo "ERROR: Could not determine device major:minor for $resume_dev"
+    exit 1
+fi
+
+# Patch GRUB if present
+if [[ -f /boot/grub/grub.cfg ]]; then
+    sed -i 's/resume=UUID=[^ ]* resume_offset=[^ ]* //g' /boot/grub/grub.cfg
+    sed -i "s|rootflags=|resume=UUID=${uuid} resume_offset=${file_offset} rootflags=|" /boot/grub/grub.cfg
+fi
+
+# Patch systemd-boot if present (kernel-install manages entries in /boot/loader/entries/)
+if [[ -d /boot/loader/entries ]]; then
+    for entry in /boot/loader/entries/*.conf; do
+        [[ -f "$entry" ]] || continue
+        # Remove old resume params and add new ones
+        sed -i "s/ resume=UUID=[^ ]* resume_offset=[^ ]*//g" "$entry"
+        sed -i "s|^options |options resume=UUID=${uuid} resume_offset=${file_offset} |" "$entry"
+    done
+fi
+
+# Set kernel resume target
 echo "$device_id" > /sys/power/resume
 echo "$file_offset" > /sys/power/resume_offset
+
+CLEANUP_NEEDED=false
+echo "Hibernate swap ready: ${HIBERNATE_FILE} ($(( memory_to_hibernate / 1048576 ))M, offset=${file_offset}, fs=${FSTYPE})"

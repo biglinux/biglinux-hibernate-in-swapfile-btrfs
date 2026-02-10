@@ -1,39 +1,71 @@
 #!/bin/bash
+set -euo pipefail
 
-# Use $1 to enable or disable
+[[ $EUID -ne 0 ]] && { echo "Error: must run as root" >&2; exit 1; }
 
-if [ "$1" = "enable" ]; then
+# Enable or disable hibernate support with dynamic swapfile (btrfs, ext4, xfs)
 
-    # Enable in mkinitramfs
-    if ! grep -q "resume" <<< "$(grep -o 'HOOKS=".*"' /etc/mkinitcpio.conf)"; then
-        sed -Ei 's/HOOKS=\((.*)\)/HOOKS=(\1 resume)/' /etc/mkinitcpio.conf
+if [[ "${1:-}" = "enable" ]]; then
+
+    # Add resume hook to mkinitcpio if not present (handles both HOOKS=() and HOOKS="" syntax)
+    if ! grep -qE '^HOOKS=.*\bresume\b' /etc/mkinitcpio.conf; then
+        sed -Ei 's/\bfilesystems\b/filesystems resume/' /etc/mkinitcpio.conf
         mkinitcpio -P
     fi
 
-    # Disable swap size verify before start systemd hibernate, because genarate swapfile after this verification
-    # Before really hibernate have another verification
+    # Bypass systemd hibernation memory check (swap is created dynamically just before hibernate)
     mkdir -p /etc/systemd/system/systemd-logind.service.d/
     mkdir -p /etc/systemd/system/systemd-hibernate.service.d/
-    echo '[Service]
-Environment=SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK=1' > /etc/systemd/system/systemd-logind.service.d/override.conf
-    echo '[Service]
-Environment=SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK=1' > /etc/systemd/system/systemd-hibernate.service.d/override.conf
+    printf '[Service]\nEnvironment=SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK=1\n' \
+        > /etc/systemd/system/systemd-logind.service.d/50-hibernate-bypass.conf
+    printf '[Service]\nEnvironment=SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK=1\n' \
+        > /etc/systemd/system/systemd-hibernate.service.d/50-hibernate-bypass.conf
 
-    # Enable services
-    # Create file and hibernate
+    systemctl daemon-reload
     systemctl enable make-swapfile-to-hibernate.service
-    
-    # Remove file after back from hibernate
     systemctl enable remove-swapfile-to-hibernate.service
-    
-elif [ "$1" = "disable" ]; then
 
-    rm -f /etc/systemd/system/systemd-logind.service.d/override.conf
-    rm -f /etc/systemd/system/systemd-hibernate.service.d/override.conf
+    echo "Hibernate support enabled"
 
+elif [[ "${1:-}" = "disable" ]]; then
+
+    # Remove systemd overrides
+    rm -f /etc/systemd/system/systemd-logind.service.d/50-hibernate-bypass.conf
+    rm -f /etc/systemd/system/systemd-hibernate.service.d/50-hibernate-bypass.conf
+
+    # Remove resume hook from mkinitcpio
+    if grep -qE '^HOOKS=.*\bresume\b' /etc/mkinitcpio.conf; then
+        sed -Ei 's/\bresume\b//;s/  +/ /g' /etc/mkinitcpio.conf
+        mkinitcpio -P
+    fi
+
+    systemctl daemon-reload
     systemctl disable make-swapfile-to-hibernate.service
     systemctl disable remove-swapfile-to-hibernate.service
-else
 
-    echo "Use swapfile_to_hibernate enable or disable"
+    echo "Hibernate support disabled"
+
+elif [[ "${1:-}" = "status" ]]; then
+    # Check hibernate support status
+    make_enabled=$(systemctl is-enabled make-swapfile-to-hibernate.service 2>/dev/null || echo "disabled")
+    resume_hook="no"
+    grep -qE '^HOOKS=.*\bresume\b' /etc/mkinitcpio.conf 2>/dev/null && resume_hook="yes"
+
+    echo "Hibernate support:"
+    echo "  Service: $make_enabled"
+    echo "  Resume hook: $resume_hook"
+
+    # Detect filesystem
+    SWAP_BASE="/swapfile"
+    if [[ -f /etc/systemd/swap.conf ]]; then
+        configured_path=$(grep -E '^swapfile_path=' /etc/systemd/swap.conf 2>/dev/null | tail -1 | cut -d= -f2-)
+        [[ -n "$configured_path" ]] && SWAP_BASE="$configured_path"
+    fi
+    FSTYPE=$(findmnt -n -o FSTYPE --target "$SWAP_BASE" 2>/dev/null || echo "unknown")
+    echo "  Swap path: $SWAP_BASE"
+    echo "  Filesystem: $FSTYPE"
+
+else
+    echo "Usage: swapfile_to_hibernate {enable|disable|status}"
+    exit 1
 fi
